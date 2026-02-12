@@ -1,0 +1,127 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  AWS_REGION: us-west-2
+  # ECR repositories are created by Terraform (one per microservice)
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push microservices
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+
+          # All microservices with Dockerfiles
+          declare -A SERVICES=(
+            ["frontend"]="src/frontend"
+            ["cartservice"]="src/cartservice/src"
+            ["productcatalogservice"]="src/productcatalogservice"
+            ["currencyservice"]="src/currencyservice"
+            ["paymentservice"]="src/paymentservice"
+            ["shippingservice"]="src/shippingservice"
+            ["checkoutservice"]="src/checkoutservice"
+            ["emailservice"]="src/emailservice"
+            ["recommendationservice"]="src/recommendationservice"
+            ["adservice"]="src/adservice"
+            ["shoppingassistantservice"]="src/shoppingassistantservice"
+            ["loadgenerator"]="src/loadgenerator"
+          )
+
+          for service in "${!SERVICES[@]}"; do
+            context="${SERVICES[$service]}"
+            dockerfile="$context/Dockerfile"
+            
+            if [ ! -f "$dockerfile" ]; then
+              echo "⚠️  WARNING: Dockerfile not found for $service at $dockerfile, skipping..."
+              continue
+            fi
+
+            IMAGE_REPO="$ECR_REGISTRY/$service"
+            IMAGE_TAG="${service}-${GITHUB_SHA::7}"
+            IMAGE_TAG_LATEST="${service}-latest"
+
+            echo ""
+            echo "=========================================="
+            echo "Building: $service"
+            echo "Context:  $context"
+            echo "Repo:     $IMAGE_REPO"
+            echo "Tag:      $IMAGE_TAG"
+            echo "=========================================="
+
+            # Build arguments for multi-platform builds
+            BUILD_ARGS=(
+              "--platform=linux/amd64"
+              "--file=$dockerfile"
+              "--tag=$IMAGE_REPO:$IMAGE_TAG"
+              "--tag=$IMAGE_REPO:$IMAGE_TAG_LATEST"
+            )
+
+            # Add platform-specific build args for services that need them
+            case "$service" in
+              frontend|productcatalogservice|shippingservice|checkoutservice)
+                # Go services with --platform=$BUILDPLATFORM
+                BUILD_ARGS+=("--build-arg" "BUILDPLATFORM=linux/amd64")
+                BUILD_ARGS+=("--build-arg" "TARGETOS=linux")
+                BUILD_ARGS+=("--build-arg" "TARGETARCH=amd64")
+                ;;
+              cartservice)
+                # .NET service with --platform=$BUILDPLATFORM
+                BUILD_ARGS+=("--build-arg" "BUILDPLATFORM=linux/amd64")
+                BUILD_ARGS+=("--build-arg" "TARGETARCH=amd64")
+                ;;
+            esac
+
+            # Special handling for adservice - needs protos directory in context
+            if [ "$service" == "adservice" ]; then
+              # adservice genproto.sh references ../../protos, so we need to ensure
+              # the build context can access it, OR proto files are pre-generated
+              # Since Dockerfile doesn't run genproto.sh, proto files should exist
+              if [ ! -f "$context/src/main/proto/demo.proto" ]; then
+                echo "⚠️  WARNING: adservice proto file not found at expected location"
+                echo "   Expected: $context/src/main/proto/demo.proto"
+                echo "   The genproto.sh script copies from ../../protos/demo.proto"
+                echo "   Make sure proto files are pre-generated or adjust build context"
+              fi
+            fi
+
+            # Build the image
+            docker build "${BUILD_ARGS[@]}" "$context"
+
+            # Push both tags
+            docker push "$IMAGE_REPO:$IMAGE_TAG"
+            docker push "$IMAGE_REPO:$IMAGE_TAG_LATEST"
+
+            echo "✅ Successfully built and pushed $service"
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "✅ All microservices built and pushed!"
+          echo "=========================================="
