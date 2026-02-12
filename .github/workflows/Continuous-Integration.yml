@@ -8,12 +8,59 @@ on:
 
 env:
   AWS_REGION: us-west-2
-  # ECR repositories are created by Terraform (one per microservice)
 
 jobs:
-  build-and-push:
+  detect-changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      services: ${{ steps.filter.outputs.changes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Detect changed services
+        uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'src/frontend/**'
+            cartservice:
+              - 'src/cartservice/**'
+            productcatalogservice:
+              - 'src/productcatalogservice/**'
+            currencyservice:
+              - 'src/currencyservice/**'
+            paymentservice:
+              - 'src/paymentservice/**'
+            shippingservice:
+              - 'src/shippingservice/**'
+            checkoutservice:
+              - 'src/checkoutservice/**'
+            emailservice:
+              - 'src/emailservice/**'
+            recommendationservice:
+              - 'src/recommendationservice/**'
+            adservice:
+              - 'src/adservice/**'
+            shoppingassistantservice:
+              - 'src/shoppingassistantservice/**'
+            loadgenerator:
+              - 'src/loadgenerator/**'
+
+  build-and-push:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.services != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for OIDC
+      contents: read
+    strategy:
+      matrix:
+        service: ${{ fromJSON(needs.detect-changes.outputs.services) }}
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,8 +68,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::183631345736:role/githubaction-fullstack-sre
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
@@ -32,96 +78,43 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push microservices
+      - name: Set build context
+        id: context
+        run: |
+          case "${{ matrix.service }}" in
+            frontend) echo "path=src/frontend" >> $GITHUB_OUTPUT ;;
+            cartservice) echo "path=src/cartservice/src" >> $GITHUB_OUTPUT ;;
+            productcatalogservice) echo "path=src/productcatalogservice" >> $GITHUB_OUTPUT ;;
+            currencyservice) echo "path=src/currencyservice" >> $GITHUB_OUTPUT ;;
+            paymentservice) echo "path=src/paymentservice" >> $GITHUB_OUTPUT ;;
+            shippingservice) echo "path=src/shippingservice" >> $GITHUB_OUTPUT ;;
+            checkoutservice) echo "path=src/checkoutservice" >> $GITHUB_OUTPUT ;;
+            emailservice) echo "path=src/emailservice" >> $GITHUB_OUTPUT ;;
+            recommendationservice) echo "path=src/recommendationservice" >> $GITHUB_OUTPUT ;;
+            adservice) echo "path=src/adservice" >> $GITHUB_OUTPUT ;;
+            shoppingassistantservice) echo "path=src/shoppingassistantservice" >> $GITHUB_OUTPUT ;;
+            loadgenerator) echo "path=src/loadgenerator" >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Build and push ${{ matrix.service }}
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          SERVICE: ${{ matrix.service }}
+          CONTEXT: ${{ steps.context.outputs.path }}
         run: |
-          set -euo pipefail
-
-          # All microservices with Dockerfiles
-          declare -A SERVICES=(
-            ["frontend"]="src/frontend"
-            ["cartservice"]="src/cartservice/src"
-            ["productcatalogservice"]="src/productcatalogservice"
-            ["currencyservice"]="src/currencyservice"
-            ["paymentservice"]="src/paymentservice"
-            ["shippingservice"]="src/shippingservice"
-            ["checkoutservice"]="src/checkoutservice"
-            ["emailservice"]="src/emailservice"
-            ["recommendationservice"]="src/recommendationservice"
-            ["adservice"]="src/adservice"
-            ["shoppingassistantservice"]="src/shoppingassistantservice"
-            ["loadgenerator"]="src/loadgenerator"
-          )
-
-          for service in "${!SERVICES[@]}"; do
-            context="${SERVICES[$service]}"
-            dockerfile="$context/Dockerfile"
-            
-            if [ ! -f "$dockerfile" ]; then
-              echo "⚠️  WARNING: Dockerfile not found for $service at $dockerfile, skipping..."
-              continue
-            fi
-
-            IMAGE_REPO="$ECR_REGISTRY/$service"
-            IMAGE_TAG="${service}-${GITHUB_SHA::7}"
-            IMAGE_TAG_LATEST="${service}-latest"
-
-            echo ""
-            echo "=========================================="
-            echo "Building: $service"
-            echo "Context:  $context"
-            echo "Repo:     $IMAGE_REPO"
-            echo "Tag:      $IMAGE_TAG"
-            echo "=========================================="
-
-            # Build arguments for multi-platform builds
-            BUILD_ARGS=(
-              "--platform=linux/amd64"
-              "--file=$dockerfile"
-              "--tag=$IMAGE_REPO:$IMAGE_TAG"
-              "--tag=$IMAGE_REPO:$IMAGE_TAG_LATEST"
-            )
-
-            # Add platform-specific build args for services that need them
-            case "$service" in
-              frontend|productcatalogservice|shippingservice|checkoutservice)
-                # Go services with --platform=$BUILDPLATFORM
-                BUILD_ARGS+=("--build-arg" "BUILDPLATFORM=linux/amd64")
-                BUILD_ARGS+=("--build-arg" "TARGETOS=linux")
-                BUILD_ARGS+=("--build-arg" "TARGETARCH=amd64")
-                ;;
-              cartservice)
-                # .NET service with --platform=$BUILDPLATFORM
-                BUILD_ARGS+=("--build-arg" "BUILDPLATFORM=linux/amd64")
-                BUILD_ARGS+=("--build-arg" "TARGETARCH=amd64")
-                ;;
-            esac
-
-            # Special handling for adservice - needs protos directory in context
-            if [ "$service" == "adservice" ]; then
-              # adservice genproto.sh references ../../protos, so we need to ensure
-              # the build context can access it, OR proto files are pre-generated
-              # Since Dockerfile doesn't run genproto.sh, proto files should exist
-              if [ ! -f "$context/src/main/proto/demo.proto" ]; then
-                echo "⚠️  WARNING: adservice proto file not found at expected location"
-                echo "   Expected: $context/src/main/proto/demo.proto"
-                echo "   The genproto.sh script copies from ../../protos/demo.proto"
-                echo "   Make sure proto files are pre-generated or adjust build context"
-              fi
-            fi
-
-            # Build the image
-            docker build "${BUILD_ARGS[@]}" "$context"
-
-            # Push both tags
-            docker push "$IMAGE_REPO:$IMAGE_TAG"
-            docker push "$IMAGE_REPO:$IMAGE_TAG_LATEST"
-
-            echo "✅ Successfully built and pushed $service"
-          done
-
-          echo ""
-          echo "=========================================="
-          echo "✅ All microservices built and pushed!"
-          echo "=========================================="
+          IMAGE_REPO="$ECR_REGISTRY/$SERVICE"
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          
+          echo "Building $SERVICE from $CONTEXT"
+          
+          docker buildx build \
+            --platform=linux/amd64 \
+            --file=$CONTEXT/Dockerfile \
+            --tag=$IMAGE_REPO:$IMAGE_TAG \
+            --tag=$IMAGE_REPO:latest \
+            --cache-from=type=registry,ref=$IMAGE_REPO:buildcache \
+            --cache-to=type=registry,ref=$IMAGE_REPO:buildcache,mode=max \
+            --push \
+            $CONTEXT
+          
+          echo "✅ Successfully built and pushed $SERVICE:$IMAGE_TAG"
